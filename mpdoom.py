@@ -1,10 +1,11 @@
 import cv2
-import numpy as np
 import mediapipe as mp
 import vizdoom as vzd
 import os
 import threading
 import time
+import ctypes
+import sys
 
 BaseOptions = mp.tasks.BaseOptions
 PoseLandmarker = mp.tasks.vision.PoseLandmarker
@@ -14,27 +15,40 @@ HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 RunningMode = mp.tasks.vision.RunningMode
 
+# Helper pra resolução da tela (posicionamento webcam e game)
+def get_screen_size() -> tuple[int, int]:
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+        try:
+            w = ctypes.windll.user32.GetSystemMetrics(0)  # SM_CXSCREEN
+            h = ctypes.windll.user32.GetSystemMetrics(1)  # SM_CYSCREEN
+            if w > 0 and h > 0:
+                return w, h
+        except Exception:
+            pass
+
 MODEL_PATH = "pose_landmarker_lite.task"
 HAND_MODEL_PATH = "hand_landmarker.task"
 
 # Thresholds p/ precisão
-EXTENSION_THRESHOLD = 0.25
+EXTENSION_THRESHOLD = 0.08
 CAM_DEAD_ZONE = 0.14
-PIP_MCP_THRESOLD = 0.06
+PIP_MCP_POINTING = 0.06
 POSE_VIZ_THRESHOLD = 0.5
 
 # Marcação dos pontos dedo indicador e ombro e pulso direito
-INDEX_PIP = 6
 INDEX_MCP = 5
+INDEX_PIP = 6
+INDEX_DIP = 7
+INDEX_TIP = 8
 RIGHT_SHOULDER = 12
 RIGHT_WRIST = 16
-
-# VizDoom actions
-MOVE_FORWARD  = [True,  False, False, False]
-MOVE_BACKWARD = [False, True,  False, False]
-TURN_LEFT     = [False, False, True,  False]
-TURN_RIGHT    = [False, False, False, True]
-NO_OP         = [False, False, False, False]
 
 # Threading
 _latest_result = None
@@ -42,7 +56,19 @@ _result_lock = threading.Lock()
 
 _latest_hand_result = None
 _hand_result_lock = threading.Lock()
-_returned_to_point = True
+
+# Forward->stop timeout
+_last_state = "STOP"
+_state_change_time = None
+
+# Trigger
+_last_trigger_time = 0
+TRIGGER_COOLDOWN = 0.35
+TRIGGER_STATE = ""
+PIP_MCP_THRESHOLD = 0.10
+
+# Tracking
+_show_landmarks = False
 
 def _on_result(result, output_image, timestamp_ms: int):
     global _latest_result
@@ -65,62 +91,177 @@ def get_latest_hand_result():
 
 # Verificações para o gatilho/disparo
 def _is_pointing(lm) -> bool:
-    return abs(lm[INDEX_PIP].x - lm[INDEX_MCP].x) < PIP_MCP_THRESOLD
+    return abs(lm[INDEX_PIP].x - lm[INDEX_MCP].x) < PIP_MCP_POINTING
 
-def _is_side(lm) -> bool:
-    return (lm[INDEX_PIP].x - lm[INDEX_MCP].x) > PIP_MCP_THRESOLD
+def detect_trigger_pull(hand_result, wrist_x: float, movement_state: str) -> bool:
 
-def detect_trigger_pull(hand_result) -> bool:
-    global _returned_to_point
+    global _last_trigger_time, TRIGGER_STATE
+    current_time = time.time()
+    
     if not hand_result or not hand_result.hand_landmarks:
-        _returned_to_point = True
+        TRIGGER_STATE = "READY"
         return False
+    
+    # cooldown
+    if current_time - _last_trigger_time < TRIGGER_COOLDOWN:
+        return False
+    
     lm = hand_result.hand_landmarks[0]
-    if _is_pointing(lm):
-        _returned_to_point = True
+    
+    # Caso STOP
+    if movement_state == "STOP":
+        tip_y = lm[INDEX_TIP].y
+        pip_y = lm[INDEX_PIP].y
+        if tip_y > pip_y:  # tip abaixo do pip
+            _last_trigger_time = current_time
+            TRIGGER_STATE = "PULLED_TRIGGER_S"
+            return True
+        TRIGGER_STATE = "STOPPED"
         return False
-    if _is_side(lm) and _returned_to_point:
-        _returned_to_point = False
-        return True
-    return False
+    
+    mcp_x = lm[INDEX_MCP].x
+    pip_x = lm[INDEX_PIP].x
+    dip_x = lm[INDEX_DIP].x
+    tip_x = lm[INDEX_TIP].x
+    
+    # Mais pontos no centro -> CENTER
+    center_points = sum(1 for x in [mcp_x, pip_x, dip_x, tip_x] if 0.4 <= x <= 0.6)
+    
+    if center_points >= 2:
+        if _is_pointing(lm):
+            # mcp---pip
+            distance = abs(pip_x - mcp_x)
+            if distance > PIP_MCP_THRESHOLD:
+                _last_trigger_time = current_time
+                TRIGGER_STATE = "PULLED_TRIGGER_C"
+                return True
+        TRIGGER_STATE = "CENTER"
+        return False
+    
+    if tip_x >= 0.6:
+        if tip_x < pip_x:
+            _last_trigger_time = current_time
+            TRIGGER_STATE = "PULLED_TRIGGER_L"
+            return True
+        TRIGGER_STATE = "LEFT"
+        return False
+    
+    elif tip_x <= 0.4:
+        if tip_x > pip_x:
+            _last_trigger_time = current_time
+            TRIGGER_STATE = "PULLED_TRIGGER_R"
+            return True
+        TRIGGER_STATE = "RIGHT"
+        return False
 
 # Verificações para movimento e direção
-def compute_arm_extension(landmarks) -> float:
-    shoulder = landmarks[RIGHT_SHOULDER]
-    wrist = landmarks[RIGHT_WRIST]
-    dx = wrist.x - shoulder.x
-    dy = wrist.y - shoulder.y
-    return float(np.sqrt(dx ** 2 + dy ** 2))
+def compute_arm_extension(shoulder_y: float, tip_y: float) -> float:
+    return float(tip_y - shoulder_y)
 
 def classify_arm_state(extension: float) -> str:
     if extension >= EXTENSION_THRESHOLD:
         return "FORWARD"
     return "STOP"
 
-def classify_turn(wrist_x: float) -> str:
+def classify_turn(wrist_x: float) -> tuple[str, float]:
+
     x = 1.0 - wrist_x # Display flipado
-    if x < 0.5 - CAM_DEAD_ZONE:
-        return "TURN_LEFT"
-    if x > 0.5 + CAM_DEAD_ZONE:
-        return "TURN_RIGHT"
-    return "STRAIGHT"
+    center = 0.5
+    
+    if x < center - CAM_DEAD_ZONE:
+        # Esquerda - velocity aumenta com distância do centro
+        velocity = min(1.0, (center - CAM_DEAD_ZONE - x) / (center - CAM_DEAD_ZONE))
+        return "TURN_LEFT", velocity
+    elif x > center + CAM_DEAD_ZONE:
+        # Direita - velocity aumenta com distância do centro
+        velocity = min(1.0, (x - (center + CAM_DEAD_ZONE)) / (1.0 - center - CAM_DEAD_ZONE))
+        return "TURN_RIGHT", velocity
+    
+    return "STRAIGHT", 0.0
 
-def get_action(move_state: str, turn_state: str, shoot: bool) -> list[bool]:
-    forward = move_state == "FORWARD"
-    turn_left = turn_state == "TURN_LEFT"
-    turn_right = turn_state == "TURN_RIGHT"
-    return [forward, False, turn_left, turn_right, shoot]
+def draw_hand_landmarks(frame, hand_result, movement_state: str, turn_state: tuple[str, float]):
 
-# Configs do VizDoom
+    if not hand_result or not hand_result.hand_landmarks:
+        return frame
+    
+    lm = hand_result.hand_landmarks[0]
+    h, w = frame.shape[:2]
+    
+    INDEX_CONNECTIONS = [(0, 5), (5, 6), (6, 7), (7, 8)]
+    
+    for start, end in INDEX_CONNECTIONS:
+        start_pos = lm[start]
+        end_pos = lm[end]
+        x1, y1 = int((1.0 - start_pos.x) * w), int(start_pos.y * h)
+        x2, y2 = int((1.0 - end_pos.x) * w), int(end_pos.y * h)
+        cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 0), 2) 
+    
+    for i in [0, 5, 6, 7, 8]:
+        landmark = lm[i]
+        x = int((1.0 - landmark.x) * w)
+        y = int(landmark.y * h)
+        
+        if i == 8:
+            color = (0, 0, 255) 
+        else:
+            color = (0, 255, 0)
+        
+        cv2.circle(frame, (x, y), 5, color, -1)
+        cv2.putText(frame, str(i), (x + 5, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    
+    turn_direction, turn_velocity = turn_state
+    
+    color = (0, 255, 0)
+    cv2.putText(frame, f"Mov: {movement_state}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    cv2.putText(frame, f"Dir: {turn_direction}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    cv2.putText(frame, f"Trig: {TRIGGER_STATE}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    
+    # X e Y
+    axis_color = (200, 200, 200) 
+    tick_length = 5
+    text_color = (200, 200, 200)
+    
+    for i in range(11): 
+        x_normalized = i / 10.0
+        x_pixel = int(x_normalized * w)
+        y_pos = h - 15
+        # tick
+        cv2.line(frame, (x_pixel, h - 2), (x_pixel, h - tick_length - 2), axis_color, 1)
+        # label
+        cv2.putText(frame, f"{x_normalized:.1f}", (x_pixel - 12, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.3, text_color, 1)
+    
+    for i in range(11):
+        y_normalized = i / 10.0
+        y_pixel = int(y_normalized * h)
+        x_pos = 20
+        cv2.line(frame, (0, y_pixel), (tick_length, y_pixel), axis_color, 1)
+        cv2.putText(frame, f"{y_normalized:.1f}", (x_pos, y_pixel + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.3, text_color, 1)
+    
+    return frame
+
+def get_action(move_state: str, turn_state: tuple[str, float], shoot: bool, apply_backward: bool) -> list[bool]:
+
+    forward = move_state == "FORWARD" and not apply_backward
+    backward = apply_backward
+    turn_direction, turn_velocity = turn_state
+    turn_left = turn_direction == "TURN_LEFT"
+    turn_right = turn_direction == "TURN_RIGHT"
+    
+    # lista boolean, padrão do vizdoom
+    return [forward, backward, turn_left, turn_right, shoot]
+
+
 def init_game() -> vzd.DoomGame:
     game = vzd.DoomGame()
     game.load_config(os.path.join(vzd.scenarios_path, "freedoom1.cfg"))
+    # Desativar buffer (freedoom ativa por padrão e bloqueia o audio)
+    game.set_audio_buffer_enabled(False)
     game.set_sound_enabled(True)
-    game.add_game_args("+snd_efx 0")
-    game.add_game_args("+snd_device 0") # Audio pro Windows (VzDoom funfa melhor no Linux)
-    game.set_screen_resolution(vzd.ScreenResolution.RES_1920X1080)
-    game.set_doom_map("E1M2") # Na fase 1 o elevador me confunde, 2 da pra reconhecer melhor
-    game.set_doom_skill(1) # Dificuldade
+    game.set_console_enabled(True)
+    game.set_screen_resolution(vzd.ScreenResolution.RES_1280X1024)
+
+    game.set_doom_map("E1M2")  # Fase (1 - elevador confuso)
+    game.set_doom_skill(1)  # BABY!!
     game.set_available_buttons([
         vzd.Button.MOVE_FORWARD,
         vzd.Button.MOVE_BACKWARD,
@@ -129,10 +270,9 @@ def init_game() -> vzd.DoomGame:
         vzd.Button.ATTACK,
     ])
     game.init()
-    time.sleep(2)
     return game
 
-def run():
+def run():      
     options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
         running_mode=RunningMode.LIVE_STREAM,
@@ -152,23 +292,28 @@ def run():
         min_tracking_confidence=0.4,
     )
 
-    DOOM_W, DOOM_H = 1920, 1080
-    DOOM_X, DOOM_Y = 0, 0
+    SCREEN_W, SCREEN_H = get_screen_size()
 
-    game = init_game()
+    CAM_W = max(360, SCREEN_W // 4)
+
     cap = cv2.VideoCapture(0)
 
     native_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     native_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    CAM_W = 640
-    CAM_H = int(CAM_W * native_h / native_w)
+    CAM_H = int(CAM_W * native_h / max(native_w, 1))
+
+    cam_x = SCREEN_W - CAM_W
 
     cv2.namedWindow("Webcam", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Webcam", CAM_W, CAM_H)
-    cv2.moveWindow("Webcam", DOOM_X + DOOM_W - CAM_W, DOOM_Y)
+    cv2.moveWindow("Webcam", cam_x-40, 30)
+    
+    # Iniciar depois do opencv pra ganhar window focus e permitir audio
+    game = init_game()
 
     with PoseLandmarker.create_from_options(options) as landmarker, \
          HandLandmarker.create_from_options(hand_options) as hand_landmarker:
+        global _last_state, _state_change_time, _show_landmarks
         timestamp_ms = 0
         while cap.isOpened():
             ret, frame = cap.read()
@@ -181,29 +326,58 @@ def run():
             landmarker.detect_async(mp_image, timestamp_ms)
             hand_landmarker.detect_async(mp_image, timestamp_ms)
 
-            cv2.imshow("Webcam", cv2.flip(frame, 1))
-
+            display_frame = cv2.resize(cv2.flip(frame, 1), (CAM_W, CAM_H))
+            
             result = get_latest_result()
             hand_result = get_latest_hand_result()
+            
             state = "STOP"
-            turn_state = "STRAIGHT"
+            turn_state = ("STRAIGHT", 0.0)
+            wrist_x = 0.5  # Default center
 
-            if result and result.pose_landmarks:
-                landmarks = result.pose_landmarks[0]
-                wrist = landmarks[RIGHT_WRIST]
-                if wrist.visibility >= POSE_VIZ_THRESHOLD:
-                    extension = compute_arm_extension(landmarks)
+            if result and result.pose_landmarks and hand_result and hand_result.hand_landmarks:
+                pose_landmarks = result.pose_landmarks[0]
+                hand_landmarks = hand_result.hand_landmarks[0]
+                
+                shoulder = pose_landmarks[RIGHT_SHOULDER]
+                wrist = pose_landmarks[RIGHT_WRIST]
+                tip = hand_landmarks[INDEX_TIP]
+                
+                if wrist.visibility >= POSE_VIZ_THRESHOLD and shoulder.visibility >= POSE_VIZ_THRESHOLD:
+                    wrist_x = wrist.x
+                    extension = compute_arm_extension(shoulder.y, tip.y)
                     state = classify_arm_state(extension)
                     turn_state = classify_turn(wrist.x)
+            
+            if _show_landmarks and hand_result:
+                display_frame = draw_hand_landmarks(display_frame, hand_result, state, turn_state)
+            
+            cv2.imshow("Webcam", display_frame)
+            cv2.waitKey(1)  # Frame display update
 
-            shoot = detect_trigger_pull(hand_result)
-            action = get_action(state, turn_state, shoot)
+            if state != _last_state:
+                _last_state = state
+                _state_change_time = time.time()
+            
+            apply_backward = False
+            if _last_state == "FORWARD" and state == "STOP" and _state_change_time is not None:
+                elapsed = time.time() - _state_change_time
+                if elapsed > 1.0:
+                    apply_backward = True
+
+            shoot = detect_trigger_pull(hand_result, wrist_x, state)
+            action = get_action(state, turn_state, shoot, apply_backward)
 
             if not game.is_episode_finished():
                 game.make_action(action)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            # 0x1B = ESC para sair
+            if ctypes.windll.user32.GetAsyncKeyState(0x1B):
                 break
+            
+            # 0x20 = SPACE para trackers
+            if ctypes.windll.user32.GetAsyncKeyState(0x20):
+                _show_landmarks = not _show_landmarks
 
             if game.is_player_dead():
                 game.respawn_player()
