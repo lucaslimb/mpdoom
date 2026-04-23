@@ -33,8 +33,8 @@ def get_screen_size() -> tuple[int, int]:
         except Exception:
             pass
 
-MODEL_PATH = "pose_landmarker_lite.task"
-HAND_MODEL_PATH = "hand_landmarker.task"
+MODEL_PATH = "models/pose_landmarker_lite.task"
+HAND_MODEL_PATH = "models/hand_landmarker.task"
 
 # Thresholds p/ precisão
 EXTENSION_THRESHOLD = 0.08
