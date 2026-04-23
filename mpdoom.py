@@ -65,7 +65,7 @@ _state_change_time = None
 _last_trigger_time = 0
 TRIGGER_COOLDOWN = 0.35
 TRIGGER_STATE = ""
-PIP_MCP_THRESHOLD = 0.10
+PIP_MCP_THRESHOLD = 0.05
 
 # Tracking
 _show_landmarks = False
@@ -153,6 +153,8 @@ def detect_trigger_pull(hand_result, wrist_x: float, movement_state: str) -> boo
             return True
         TRIGGER_STATE = "RIGHT"
         return False
+
+    return False
 
 # Verificações para movimento e direção
 def compute_arm_extension(shoulder_y: float, tip_y: float) -> float:
@@ -260,7 +262,7 @@ def init_game() -> vzd.DoomGame:
     game.set_console_enabled(True)
     game.set_screen_resolution(vzd.ScreenResolution.RES_1280X1024)
 
-    game.set_doom_map("E1M2")  # Fase (1 - elevador confuso)
+    game.set_doom_map("E1M6")  # Fase (6 é a melhor pra testar)
     game.set_doom_skill(1)  # BABY!!
     game.set_available_buttons([
         vzd.Button.MOVE_FORWARD,
