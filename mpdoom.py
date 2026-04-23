@@ -68,7 +68,7 @@ TRIGGER_STATE = ""
 PIP_MCP_THRESHOLD = 0.05
 
 # Tracking
-_show_landmarks = False
+_show_landmarks = True
 
 def _on_result(result, output_image, timestamp_ms: int):
     global _latest_result

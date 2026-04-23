@@ -2,6 +2,10 @@
 
 Mapeia gestos de mão e pose (MediaPipe) para controles do Doom clássico com a biblioteca ViZDoom e WAD Fredoom. Permite controlar movimento, mira e disparo usando gestos.
 
+[Vídeo do projeto](https://youtu.be/Pw6oNyOBjBM)
+
+![Screenshot](assets/screenshot.png)
+
 ## Grupo TB — Checkpoint 2 — Cognitive Computing & Computer Vision
 
 Ana, Felipe, Isabella, Lucas e Martin
@@ -44,7 +48,7 @@ Inicie o jogo:
 python mpdoom.py
 ```
 
-- Pressione `SPACE` para exibir tracking
+- Pressione `SPACE` para exibir/esconder tracking
 - Pressione `ESC` para sair
 
 ## Comandos de gesto
@@ -56,4 +60,4 @@ Gestos são imersivos e combinados com fluidez!
 | Antebraço direito estendido | Andar pra frente | Index TIP distante (vertical) do ombro |
 | Braço direito retraído | Parar | Index TIP próximo (vertical) do ombro |
 | Antebraço direito lateral (movimento) | Mirar / mover câmera | Pulso movimentando (horizontal) |
-| Dedo indicador: estende → retraído | Atirar | Comparação de posições de 4 pontos do Index (TIP/DIP/PIP/MCP) |
+| Dedo indicador: estende → retraído | Atirar | Comparação de posições (horizontal/vertical) de 4 pontos do Index (TIP/DIP/PIP/MCP) |
